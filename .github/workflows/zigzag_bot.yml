@@ -1,0 +1,32 @@
+name: EGX ZigZag Sniper
+
+on:
+  schedule:
+    # يشتغل كل 15 دقيقة
+    # التوقيت هنا UTC (مصر UTC+2 أو +3)
+    # يعني من 7 UTC لـ 13 UTC بيغطي وقت الجلسة المصرية
+    - cron: '*/15 7-13 * * 0-4'
+  workflow_dispatch: # عشان تقدر تشغله يدوي
+
+jobs:
+  run-sniper:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Run Bot
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        DESTINATIONS: ${{ secrets.DESTINATIONS }}
+      run: python main.py
