@@ -79,9 +79,9 @@ def get_egx_symbols():
 # 4. سحب الهيستوري (UDF API)
 # ---------------------------------------------------------
 def get_tv_candles(symbol, n_bars=100):
-    # بنزود عدد الشموع عشان نقدر نرجع لورا في المانيوال
+    # بنجيب داتا كفاية (آخر 15 يوم) عشان نضمن اننا نغطي إجازات العيد لو وجدت
     to_time = int(time.time())
-    from_time = to_time - (15 * 24 * 60 * 60) # آخر 15 يوم عشان نضمن داتا كافية
+    from_time = to_time - (15 * 24 * 60 * 60) 
     
     url = f"https://udf-data-feed.tradingview.com/udf/history?symbol={symbol}&resolution=60&from={from_time}&to={to_time}"
     
@@ -99,7 +99,7 @@ def get_tv_candles(symbol, n_bars=100):
             'close': data['c']
         })
         
-        # تحويل الوقت لتوقيت القاهرة للقراءة
+        # تحويل الوقت لتوقيت القاهرة
         cairo_tz = pytz.timezone('Africa/Cairo')
         df['dt'] = pd.to_datetime(df['time'], unit='s').dt.tz_localize('UTC').dt.tz_convert(cairo_tz)
         
@@ -116,29 +116,25 @@ def analyze_market():
     cairo_tz = pytz.timezone('Africa/Cairo')
     current_time = datetime.datetime.now(cairo_tz).strftime('%I:%M %p')
     
-    # تحديد المود: هل هو بحث تاريخي (Manual) ولا لايف (Auto)؟
-    # لو مجدول والسوق فاتح -> لايف (آخر شمعة بس)
-    # لو يدوي أو السوق قافل -> تاريخي (آخر 3 جلسات)
-    
     IS_HISTORY_MODE = False
     
     if GITHUB_EVENT_NAME == 'schedule':
         if not is_open:
             print(f"😴 تشغيل مجدول ولكن {status_msg}. (تجاهل)")
             return
-        IS_HISTORY_MODE = False # Auto Live
+        IS_HISTORY_MODE = False 
     else:
-        # يدوي (workflow_dispatch)
         IS_HISTORY_MODE = True
 
     tickers = get_egx_symbols()
-    print(f"📊 جاري التحليل.. المود: {'تاريخي (آخر 3 جلسات)' if IS_HISTORY_MODE else 'لايف (لحظي)'}")
+    mode_text = 'تاريخي (آخر 3 جلسات)' if IS_HISTORY_MODE else 'لايف (لحظي)'
+    print(f"📊 جاري التحليل.. المود: {mode_text}")
 
     opportunities = []
     
     for symbol in tickers:
         try:
-            # لو تاريخي بنحتاج داتا أكتر عشان نرجع لورا
+            # نسحب داتا بزيادة شوية عشان الحسابات
             data = get_tv_candles(symbol, n_bars=100 if IS_HISTORY_MODE else 40)
             
             if data is None or len(data) < 20:
@@ -149,36 +145,40 @@ def analyze_market():
             data['Upper_Channel'] = data['high'].rolling(window=period).max().shift(1)
             data['Lower_Channel'] = data['low'].rolling(window=period).min().shift(1)
             
-            # --- الفلترة ---
             found_signal = None
             
             if IS_HISTORY_MODE:
-                # بنلف من ورا لقدام (من أحدث شمعة لأقدم شمعة)
-                # بنبحث في آخر 20 شمعة (حوالي 3-4 جلسات تداول)
-                search_window = 20 
+                # 📌 التعديل هنا:
+                # اليوم = 5 شمعات ساعة.
+                # 3 أيام = 15 شمعة.
+                # بنبحث في آخر 15 شمعة متوفرة (بغض النظر عن التواريخ، دي شموع تداول فعلية)
+                search_window = 15 
+                
+                # بنلف من الأحدث للأقدم
                 for i in range(len(data)-1, len(data)-search_window, -1):
                     row = data.iloc[i]
                     close = row['close']
                     upper = row['Upper_Channel']
                     lower = row['Lower_Channel']
+                    
+                    # تنسيق الوقت عشان نعرف الإشارة كانت يوم إيه والساعة كام
                     date_str = row['dt'].strftime('%d/%m %I:%M%p')
 
-                    # شرط الزيج زاج
                     if close > upper:
                         found_signal = {
                             'symbol': symbol, 'price': close, 'signal': "🔥 شراء (سابق)", 
-                            'upper': upper, 'lower': lower, 'time': date_str, 'is_fresh': (i == len(data)-1)
+                            'upper': upper, 'lower': lower, 'time': date_str
                         }
-                        break # لقينا أحدث إشارة، نوقف تدوير في السهم ده
+                        break 
                     elif close < lower:
                         found_signal = {
                             'symbol': symbol, 'price': close, 'signal': "🔻 بيع (سابق)", 
-                            'upper': upper, 'lower': lower, 'time': date_str, 'is_fresh': (i == len(data)-1)
+                            'upper': upper, 'lower': lower, 'time': date_str
                         }
                         break
             
             else:
-                # Mode: Live Auto (Check ONLY last candle)
+                # Live Mode: Check ONLY last candle
                 row = data.iloc[-1]
                 close = row['close']
                 upper = row['Upper_Channel']
@@ -189,9 +189,7 @@ def analyze_market():
                 elif close < lower:
                     found_signal = {'symbol': symbol, 'price': close, 'signal': "🔻 كسر دعم (بيع)", 'upper': upper, 'lower': lower, 'time': 'الآن'}
 
-            # لو لقينا حاجة نضيفها
             if found_signal:
-                # تنظيف الاسم
                 clean_symbol = symbol.split(":")[1] if ":" in symbol else symbol
                 found_signal['symbol'] = clean_symbol
                 opportunities.append(found_signal)
@@ -201,23 +199,20 @@ def analyze_market():
 
     # --- إرسال التقرير ---
     if opportunities:
-        # لو مانيوال، رتبهم بالأحدث أولاً
         if IS_HISTORY_MODE:
-            # بنحاول نرتب بالتاريخ التقريبي (مجازاً هنا هنعرضهم زي ما جم بس ممكن نرتبهم)
-            opportunities.reverse() 
+            # (اختياري) ممكن نرتبهم هنا لو حابب
+            pass 
 
-        title = "📜 **تقرير الفرص الأخيرة (آخر 3 جلسات)**" if IS_HISTORY_MODE else "⚡ **إشارات حية (Live)** ⚡"
+        title = "📜 **تقرير الفرص (آخر 3 جلسات)**" if IS_HISTORY_MODE else "⚡ **إشارات حية (Live)** ⚡"
         
         msg = f"{title}\n🕒 {current_time}\n"
         msg += "ــــــــــــــــــــــــــــــــــــــــــــــــ\n"
         
         count = 0
         for op in opportunities:
-            # في المانيوال، مش عايزين نبعت كل حاجة، نبعت أهم 20 سهم مثلاً عشان الرسالة متطولش
             if count >= 20: break 
             
             icon = "🟢" if "شراء" in op['signal'] else "🔴"
-            # لو الإشارة قديمة شوية نكتب وقتها
             time_label = f" ({op['time']})" if IS_HISTORY_MODE else ""
             
             msg += f"{icon} **{op['symbol']}**{time_label}\n"
@@ -225,11 +220,10 @@ def analyze_market():
             msg += f"السعر: {op['price']} | القناة: {round(op['lower'], 2)} - {round(op['upper'], 2)}\n\n"
             count += 1
         
-        msg += f"📈 إجمالي الفرص المرصودة: {len(opportunities)}"
+        msg += f"📈 إجمالي الفرص: {len(opportunities)}"
         print("📨 Sending Telegram Report...")
         send_message(msg)
     else:
-        # رسالة لو مفيش حاجة خالص
         if IS_HISTORY_MODE:
              send_message(f"🕵️‍♂️ **فحص يدوي**\n🕒 {current_time}\nلم يتم العثور على إشارات اختراق صريحة في آخر 3 جلسات.")
         print("😴 لا توجد فرص.")
