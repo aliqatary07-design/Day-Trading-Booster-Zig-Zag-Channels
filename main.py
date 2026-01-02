@@ -10,11 +10,12 @@ from tvDatafeed import TvDatafeed, Interval
 # ---------------------------------------------------------
 # 1. إعدادات البوت والبيئة
 # ---------------------------------------------------------
-# هنجيب البيانات من إعدادات GitHub Secrets
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-# هنا بنحول النص لليستة، افصل الايديهات بفاصلة في الـ Secret
-# مثال للـ Secret: 929830200,1302442906
 DESTINATIONS = os.environ.get("DESTINATIONS", "").split(",") 
+
+# بنجيب نوع التشغيل (هل هو جدول زمني schedule ولا يدوي workflow_dispatch)
+# GitHub بيحط المتغير ده أوتوماتيك
+GITHUB_EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
 
 def send_message(text):
     for chat_id in DESTINATIONS:
@@ -27,30 +28,27 @@ def send_message(text):
                 print(f"❌ Error sending to {chat_id}: {e}")
 
 # ---------------------------------------------------------
-# 2. التأكد من وقت الجلسة (بتوقيت القاهرة)
+# 2. فحص حالة السوق (مفتوح ولا مغلق)
 # ---------------------------------------------------------
-def is_market_open():
+def check_market_status():
     cairo_tz = pytz.timezone('Africa/Cairo')
     now = datetime.datetime.now(cairo_tz)
     
-    # أيام العمل: الأحد=6 ... الخميس=3
-    # الجمعة(4) والسبت(5) إجازة
+    # أيام الإجازة: الجمعة (4) والسبت (5)
     if now.weekday() in [4, 5]: 
-        print("😴 اليوم عطلة رسمية.")
-        return False
+        return False, "عطلة أسبوعية"
 
-    # وقت الجلسة من 10:00 ص لـ 2:45 م (شاملة الجلسة الاستكشافية والمزاد)
+    # وقت الجلسة: من 10:00 ص لـ 2:45 م
     start = now.replace(hour=10, minute=0, second=0, microsecond=0)
     end = now.replace(hour=14, minute=45, second=0, microsecond=0)
     
     if start <= now <= end:
-        return True
+        return True, "جلسة تداول"
     
-    print(f"😴 السوق مغلق حالياً. الساعة: {now.strftime('%I:%M %p')}")
-    return False
+    return False, "سوق مغلق"
 
 # ---------------------------------------------------------
-# 3. سحب قائمة الأسهم (طريقتك - Scanner API)
+# 3. سحب قائمة الأسهم (Scanner API)
 # ---------------------------------------------------------
 def get_egx_symbols():
     print("🔎 جاري سحب قائمة الأسهم من TradingView Scanner...")
@@ -72,16 +70,14 @@ def get_egx_symbols():
         symbols = []
         for item in data['data']:
             d = item['d']
-            symbol_code = d[0] # اسم السهم
-            desc = d[2]        # الوصف
+            symbol_code = d[0]
+            desc = d[2]
             
-            # 🧹 فلتر النظافة (حقوق الاكتتاب)
+            # فلتر الحقوق والاكتتابات
             if "حق" in desc or "Right" in desc or "اكتتاب" in desc:
                 continue
             
-            # بنرجع الرمز بصيغة EGX:SYMBOL عشان المكتبة التانية تفهمه
             symbols.append(symbol_code)
-            
         return symbols
 
     except Exception as e:
@@ -89,31 +85,44 @@ def get_egx_symbols():
         return []
 
 # ---------------------------------------------------------
-# 4. تحليل الزيج زاج (ZigZag Channel)
+# 4. التحليل الرئيسي
 # ---------------------------------------------------------
 def analyze_market():
-    if not is_market_open():
+    # فحص حالة السوق
+    is_open, status_msg = check_market_status()
+    
+    cairo_tz = pytz.timezone('Africa/Cairo')
+    current_time = datetime.datetime.now(cairo_tz).strftime('%I:%M %p').replace("AM", "ص").replace("PM", "م")
+    
+    # --- اللوجيك الجديد للتشغيل ---
+    extra_note = ""
+    
+    # الحالة 1: تشغيل مجدول (Schedule) والسوق قافل -> اقفل وماتعملش حاجة
+    if GITHUB_EVENT_NAME == 'schedule' and not is_open:
+        print(f"😴 تشغيل مجدول ولكن {status_msg}. (لن يتم السحب)")
         return
 
-    # 1. هات لستة الأسهم الحالية
-    tickers = get_egx_symbols()
-    print(f"📊 تم العثور على {len(tickers)} سهم نشط. جاري التحليل...")
+    # الحالة 2: تشغيل يدوي (Manual) والسوق قافل -> اشتغل بس نبهني
+    if not is_open:
+        print(f"⚠️ تشغيل يدوي في وقت الإغلاق ({status_msg}). جاري سحب آخر بيانات...")
+        extra_note = f"\n🚫 **تنبيه:** السوق مغلق ({status_msg}).\n📊 **هذه البيانات بناءً على آخر إغلاق للسوق.**\n"
 
-    # تهيئة الاتصال لسحب الهيستوري
+    # --- بداية السحب والتحليل ---
+    tickers = get_egx_symbols()
+    print(f"📊 تم العثور على {len(tickers)} سهم. جاري التحليل...")
+
     tv = TvDatafeed() 
-    
     opportunities = []
 
     for symbol in tickers:
         try:
-            # نسحب داتا الساعة (آخر 60 شمعة تكفي لحساب القنوات)
+            # سحب هيستوري (ساعة)
             data = tv.get_hist(symbol=symbol, exchange='EGX', interval=Interval.in_1_hour, n_bars=60)
             
             if data is None or data.empty:
                 continue
 
-            # --- ZigZag / Channel Logic (Simulated) ---
-            # بنحسب القناة بناء على أعلى قمة وأقل قاع في آخر 20 شمعة
+            # ZigZag Simulation Logic
             period = 20
             data['Upper_Channel'] = data['high'].rolling(window=period).max().shift(1)
             data['Lower_Channel'] = data['low'].rolling(window=period).min().shift(1)
@@ -123,18 +132,12 @@ def analyze_market():
             upper = last_bar['Upper_Channel']
             lower = last_bar['Lower_Channel']
             
-            # --- شروط الإشارة ---
             signal_type = None
-            
-            # 1. كسر القناة العلوية (اختراق قمة) -> شراء
             if close > upper:
                 signal_type = "🔥 اختراق (شراء)"
-            
-            # 2. كسر القناة السفلية (كسر قاع) -> بيع
             elif close < lower:
                 signal_type = "🔻 كسر دعم (بيع)"
 
-            # لو في إشارة، ضيفها للفرص
             if signal_type:
                 opportunities.append({
                     'symbol': symbol,
@@ -143,25 +146,19 @@ def analyze_market():
                     'upper': upper,
                     'lower': lower
                 })
-            
-            # تريح السيرفر شوية عشان ميعملش بلوك
-            # time.sleep(0.1) 
 
         except Exception as e:
             continue
 
-    # ---------------------------------------------------------
-    # 5. إرسال التقرير
-    # ---------------------------------------------------------
-    cairo_tz = pytz.timezone('Africa/Cairo')
-    current_time = datetime.datetime.now(cairo_tz).strftime('%I:%M %p').replace("AM", "ص").replace("PM", "م")
-
+    # --- إرسال التقرير ---
     if opportunities:
-        msg = f"⚡ **ZigZag Booster Signals** ⚡\n🕒 {current_time}\n"
+        msg = f"⚡ **ZigZag Booster Signals** ⚡\n"
+        if extra_note:
+            msg += extra_note
+        msg += f"🕒 {current_time}\n"
         msg += "ــــــــــــــــــــــــــــــــــــــــــــــــ\n"
         
-        # نبعت أول 15 فرصة بس عشان رسالة تليجرام متضربش
-        for op in opportunities[:15]:
+        for op in opportunities[:15]: # أول 15 فرصة
             icon = "🟢" if "شراء" in op['signal'] else "🔴"
             msg += f"{icon} **{op['symbol']}**\n"
             msg += f"القرار: {op['signal']}\n"
@@ -173,7 +170,11 @@ def analyze_market():
         print("📨 Sending Telegram Report...")
         send_message(msg)
     else:
-        print("😴 لا توجد إشارات اختراق للقنوات حالياً.")
+        # لو يدوي ومفيش فرص، ابعتلي قول مفيش
+        if GITHUB_EVENT_NAME != 'schedule':
+            no_op_msg = f"⚡ **ZigZag Booster** ⚡\n{extra_note}🕒 {current_time}\n✅ تم المسح، لا توجد إشارات اختراق حالياً."
+            send_message(no_op_msg)
+        print("😴 لا توجد فرص.")
 
 if __name__ == "__main__":
     analyze_market()
