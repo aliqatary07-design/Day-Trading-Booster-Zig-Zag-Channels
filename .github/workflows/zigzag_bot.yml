@@ -1,22 +1,31 @@
-name: Run EGX Signal Bot
+name: EGX Trading Bot
 
 on:
   schedule:
-    - cron: '0 * * * *' # كل ساعة
-  workflow_dispatch:
+    # Runs at minute 0 past every hour
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allows manual trigger button
 
 jobs:
-  run:
+  run-signals:
     runs-on: ubuntu-latest
+    
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python 3.11
       uses: actions/setup-python@v4
       with:
-        python-version: 3.11
+        python-version: '3.11'
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install yfinance pandas numpy requests
-    - name: Run bot
+        pip install pandas numpy yfinance requests
+
+    - name: Run Trading Bot
+      env:
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
       run: python egx_signal_bot.py
