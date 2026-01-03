@@ -1,8 +1,6 @@
 import os
 import time
-import json
 import pandas as pd
-import numpy as np
 import requests
 from tvDatafeed import TvDatafeed, Interval
 
@@ -37,22 +35,22 @@ def get_egx_symbols_from_screener():
     """
     Scrapes the official TradingView Egypt Screener API to get ALL active stocks.
     Filters: Stock Type = Common/Preference, Status = Active.
-    Sorts by: Volume (descending) to prioritize liquid stocks.
+    Sorts by: Volume (descending).
     """
     print("🌍 Scanning TradingView Egypt Screener for all active stocks...")
     
-    # Payload replicates the actual TradingView Screener request
+    # FIXED: Changed 'true' to 'True' for Python boolean
     payload = {
         "filter": [
             {"left": "type", "operation": "equal", "right": "stock"},
             {"left": "exchange", "operation": "equal", "right": "EGX"},
-            {"left": "active_symbol", "operation": "equal", "right": true} 
+            {"left": "active_symbol", "operation": "equal", "right": True} 
         ],
         "options": {"lang": "en"},
         "symbols": {"query": {"types": []}},
         "columns": ["name", "close", "volume", "recommendation_mark"],
         "sort": {"sortBy": "volume", "sortOrder": "desc"},
-        "range": [0, 300]  # Get top 300 stocks (covers entire EGX)
+        "range": [0, 300]
     }
 
     try:
@@ -60,15 +58,13 @@ def get_egx_symbols_from_screener():
         response.raise_for_status()
         data = response.json()
         
-        # Extract symbol names (The scanner returns 'EGX:SYMBOL', we just need 'SYMBOL')
-        # The 'name' field in 'd' usually looks like "COMI" or "EGX:COMI"
+        # Extract symbol names
         symbols = [row['d'][0] for row in data['data']]
         
         print(f"✅ Found {len(symbols)} active EGX stocks.")
         return symbols
     except Exception as e:
         print(f"❌ Error fetching screener data: {e}")
-        # Fallback list in case scanner API fails temporarily
         return ['COMI', 'SWDY', 'ETEL', 'FWRY', 'HRHO']
 
 def calculate_vwap(df):
@@ -93,12 +89,9 @@ def analyze_market():
     for symbol in symbols:
         try:
             # 3. Fetch Data (1 Hour Interval)
-            # We use 'EGX' as exchange. Some symbols might need 'CASE' but EGX is standard on TV.
             data = tv.get_hist(symbol=symbol, exchange='EGX', interval=Interval.in_1_hour, n_bars=300)
             
-            # Validation: Check if data is empty or insufficient
             if data is None or data.empty or len(data) < 200:
-                # print(f"⚠️ Skipping {symbol}: Insufficient data") # Reduce noise
                 continue
 
             # Standardize Columns
@@ -109,7 +102,7 @@ def analyze_market():
             data['ema200'] = data['close'].ewm(span=200, adjust=False).mean()
             data['vwap'] = calculate_vwap(data)
             
-            # Pivot High/Low (Donchian 20-period, shifted 1 to avoid lookahead bias)
+            # Pivot High/Low (Donchian 20-period, shifted 1)
             data['pivot_high'] = data['high'].rolling(window=20).max().shift(1)
             data['pivot_low'] = data['low'].rolling(window=20).min().shift(1)
             
@@ -118,11 +111,9 @@ def analyze_market():
 
             # 5. Signal Logic
             curr = data.iloc[-1]
-            
             close = curr['close']
             vol = curr['volume']
             
-            # Skip if any indicator is NaN (e.g. recent IPOs)
             if pd.isna(curr['ema200']) or pd.isna(curr['pivot_high']):
                 continue
 
@@ -167,11 +158,9 @@ def analyze_market():
                 print(f"🔔 SELL SIGNAL: {symbol}")
                 send_telegram_message(msg)
             
-            # Rate limit protection (prevents TV ban)
             time.sleep(0.3)
 
         except Exception as e:
-            # print(f"❌ Error on {symbol}: {e}")
             continue
 
 if __name__ == "__main__":
