@@ -1,179 +1,178 @@
 import os
-import yfinance as yf
+import time
+import json
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timedelta
+from tvDatafeed import TvDatafeed, Interval
 
 # --- CONFIGURATION ---
-# EGX Symbols to Monitor (Add more as needed)
-SYMBOLS = [
-    "COMI.CA",  # CIB
-    "HRHO.CA",  # EFG Hermes
-    "ETEL.CA",  # Telecom Egypt
-    "AMOC.CA",  # AMOC
-    "ESRS.CA",  # Ezz Steel
-    "SWDY.CA",  # Elsewedy Electric
-    "AREH.CA",  # Arpeggio
-    "RMSK.CA",  # Rameda
-    "FWRY.CA",  # Fawry
-    "EKHO.CA",  # Egypt Kuwait Holding
-]
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-# Telegram Secrets (Loaded from Environment Variables)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# TradingView Scanner API Endpoint for Egypt
+SCANNER_URL = "https://scanner.tradingview.com/egypt/scan"
 
 def send_telegram_message(message):
-    """Sends a formatted message to the configured Telegram chat."""
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Error: BOT_TOKEN or CHAT_ID not found in environment variables.")
+    """Sends a message to the defined Telegram chat."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Telegram credentials missing. Check environment variables.")
         return
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": CHAT_ID,
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "Markdown"
     }
     
     try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        print("✅ Telegram alert sent successfully.")
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"❌ Telegram send failed: {response.text}")
     except Exception as e:
-        print(f"❌ Failed to send Telegram alert: {e}")
+        print(f"❌ Telegram Connection Error: {e}")
+
+def get_egx_symbols_from_screener():
+    """
+    Scrapes the official TradingView Egypt Screener API to get ALL active stocks.
+    Filters: Stock Type = Common/Preference, Status = Active.
+    Sorts by: Volume (descending) to prioritize liquid stocks.
+    """
+    print("🌍 Scanning TradingView Egypt Screener for all active stocks...")
+    
+    # Payload replicates the actual TradingView Screener request
+    payload = {
+        "filter": [
+            {"left": "type", "operation": "equal", "right": "stock"},
+            {"left": "exchange", "operation": "equal", "right": "EGX"},
+            {"left": "active_symbol", "operation": "equal", "right": true} 
+        ],
+        "options": {"lang": "en"},
+        "symbols": {"query": {"types": []}},
+        "columns": ["name", "close", "volume", "recommendation_mark"],
+        "sort": {"sortBy": "volume", "sortOrder": "desc"},
+        "range": [0, 300]  # Get top 300 stocks (covers entire EGX)
+    }
+
+    try:
+        response = requests.post(SCANNER_URL, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Extract symbol names (The scanner returns 'EGX:SYMBOL', we just need 'SYMBOL')
+        # The 'name' field in 'd' usually looks like "COMI" or "EGX:COMI"
+        symbols = [row['d'][0] for row in data['data']]
+        
+        print(f"✅ Found {len(symbols)} active EGX stocks.")
+        return symbols
+    except Exception as e:
+        print(f"❌ Error fetching screener data: {e}")
+        # Fallback list in case scanner API fails temporarily
+        return ['COMI', 'SWDY', 'ETEL', 'FWRY', 'HRHO']
 
 def calculate_vwap(df):
-    """Calculates Volume Weighted Average Price (VWAP) resetting daily."""
-    # We ensure the index is datetime to group by date
-    df['Date'] = df.index.date
+    """Calculates daily resetting VWAP."""
+    df = df.copy()
+    df['date'] = df.index.date
+    df['typ_price'] = (df['high'] + df['low'] + df['close']) / 3
+    df['tp_vol'] = df['typ_price'] * df['volume']
     
-    # Calculate Typical Price
-    df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
-    df['TP_Volume'] = df['Typical_Price'] * df['Volume']
-    
-    # Cumulative Sums grouped by Date (resets every day)
-    # Using transform to keep the original index structure
-    cum_tp_vol = df.groupby('Date')['TP_Volume'].cumsum()
-    cum_vol = df.groupby('Date')['Volume'].cumsum()
-    
-    df['VWAP'] = cum_tp_vol / cum_vol
-    return df['VWAP']
+    cum_tp_vol = df.groupby('date')['tp_vol'].cumsum()
+    cum_vol = df.groupby('date')['volume'].cumsum()
+    return cum_tp_vol / cum_vol
 
-def process_symbol(symbol):
-    print(f"🔄 Analyzing {symbol}...")
+def analyze_market():
+    # 1. Get Dynamic Symbol List
+    symbols = get_egx_symbols_from_screener()
     
-    # 1. Fetch Data (1 Hour Interval, last 60 days to ensure enough data for EMA200)
-    try:
-        df = yf.download(symbol, period="60d", interval="1h", progress=False)
-        if df.empty or len(df) < 200:
-            print(f"⚠️ Not enough data for {symbol}")
-            return
-    except Exception as e:
-        print(f"❌ Error fetching {symbol}: {e}")
-        return
+    # 2. Initialize Datafeed
+    print("🚀 Connecting to TradingView Datafeed...")
+    tv = TvDatafeed(auto_login=False) 
+    
+    for symbol in symbols:
+        try:
+            # 3. Fetch Data (1 Hour Interval)
+            # We use 'EGX' as exchange. Some symbols might need 'CASE' but EGX is standard on TV.
+            data = tv.get_hist(symbol=symbol, exchange='EGX', interval=Interval.in_1_hour, n_bars=300)
+            
+            # Validation: Check if data is empty or insufficient
+            if data is None or data.empty or len(data) < 200:
+                # print(f"⚠️ Skipping {symbol}: Insufficient data") # Reduce noise
+                continue
 
-    # 2. Indicator Calculation (Pure Math)
-    # EMA 50 & 200
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    # VWAP (Intraday)
-    df['VWAP'] = calculate_vwap(df)
-    
-    # Pivot High / Pivot Low (Rolling 20-period)
-    df['Pivot_High_20'] = df['High'].rolling(window=20).max()
-    df['Pivot_Low_20'] = df['Low'].rolling(window=20).min()
-    
-    # Average Volume (20-period)
-    df['Avg_Vol_20'] = df['Volume'].rolling(window=20).mean()
+            # Standardize Columns
+            data.columns = [col.split(':')[-1].lower() if ':' in col else col.lower() for col in data.columns]
+            
+            # 4. Indicators (Pure Math)
+            data['ema50'] = data['close'].ewm(span=50, adjust=False).mean()
+            data['ema200'] = data['close'].ewm(span=200, adjust=False).mean()
+            data['vwap'] = calculate_vwap(data)
+            
+            # Pivot High/Low (Donchian 20-period, shifted 1 to avoid lookahead bias)
+            data['pivot_high'] = data['high'].rolling(window=20).max().shift(1)
+            data['pivot_low'] = data['low'].rolling(window=20).min().shift(1)
+            
+            # Volume Moving Average
+            data['avg_vol'] = data['volume'].rolling(window=20).mean()
 
-    # 3. Get latest closed candle
-    # We take the second to last row [-2] if the market is currently open and the last candle is forming.
-    # However, for hourly scripts, usually the last completed row is desired. 
-    # yfinance '1h' often includes the current partial candle. 
-    # We will use the last available row [-1] but ensure we treat it as the "current signal" check.
-    current = df.iloc[-1]
-    
-    # Extract values for readability
-    close = current['Close']
-    ema50 = current['EMA_50']
-    ema200 = current['EMA_200']
-    vwap = current['VWAP']
-    pivot_high = current['Pivot_High_20']
-    pivot_low = current['Pivot_Low_20']
-    volume = current['Volume']
-    avg_vol = current['Avg_Vol_20']
-    timestamp = df.index[-1].strftime('%Y-%m-%d %H:%M')
+            # 5. Signal Logic
+            curr = data.iloc[-1]
+            
+            close = curr['close']
+            vol = curr['volume']
+            
+            # Skip if any indicator is NaN (e.g. recent IPOs)
+            if pd.isna(curr['ema200']) or pd.isna(curr['pivot_high']):
+                continue
 
-    # 4. Signal Logic (Strict)
-    
-    # BUY CONDITIONS
-    # 1. Close > EMA(50)
-    # 2. Close > EMA(200)
-    # 3. Close > VWAP
-    # 4. Close > Pivot High (20-period)  -> Technically a breakout
-    # 5. Volume >= 20-period average
-    
-    buy_cond = (
-        (close > ema50) and
-        (close > ema200) and
-        (close > vwap) and
-        (close > pivot_high) and # Note: Close > previous 20 max implies a breakout or at highs
-        (volume >= avg_vol)
-    )
+            # BUY RULES
+            buy_signal = (
+                close > curr['ema50'] and
+                close > curr['ema200'] and
+                close > curr['vwap'] and
+                close > curr['pivot_high'] and
+                vol >= curr['avg_vol']
+            )
 
-    # SELL CONDITIONS
-    # 1. Close < EMA(50)
-    # 2. Close < EMA(200)
-    # 3. Close < VWAP
-    # 4. Close < Pivot Low (20-period)
-    # 5. Volume >= 20-period average
-    
-    sell_cond = (
-        (close < ema50) and
-        (close < ema200) and
-        (close < vwap) and
-        (close < pivot_low) and
-        (volume >= avg_vol)
-    )
+            # SELL RULES
+            sell_signal = (
+                close < curr['ema50'] and
+                close < curr['ema200'] and
+                close < curr['vwap'] and
+                close < curr['pivot_low'] and
+                vol >= curr['avg_vol']
+            )
 
-    # 5. Execute Alert
-    signal_type = None
-    emoji = ""
-    
-    if buy_cond:
-        signal_type = "STRONG BUY"
-        emoji = "📈 🟢"
-    elif sell_cond:
-        signal_type = "STRONG SELL"
-        emoji = "📉 🔴"
+            # 6. Telegram Alert
+            if buy_signal:
+                msg = (
+                    f"📈 **STRONG BUY: {symbol}**\n"
+                    f"Price: {close:.2f}\n"
+                    f"Vol: {int(vol)} (Avg: {int(curr['avg_vol'])})\n"
+                    f"Breakout: > {curr['pivot_high']:.2f}\n"
+                    f"Trend: Above EMA200 & VWAP"
+                )
+                print(f"🔔 BUY SIGNAL: {symbol}")
+                send_telegram_message(msg)
 
-    if signal_type:
-        msg = (
-            f"{emoji} **EGX SIGNAL ALERT** {emoji}\n"
-            f"--------------------------------\n"
-            f"**Symbol:** `{symbol}`\n"
-            f"**Type:** {signal_type}\n"
-            f"**Price:** {close:.2f} EGP\n"
-            f"**Time:** {timestamp}\n"
-            f"--------------------------------\n"
-            f"📊 **Tech Stats:**\n"
-            f"• Vol: {int(volume)} (Avg: {int(avg_vol)})\n"
-            f"• VWAP: {vwap:.2f}\n"
-            f"• EMA50: {ema50:.2f} | EMA200: {ema200:.2f}"
-        )
-        send_telegram_message(msg)
-    else:
-        # Optional: Log no signal found for debugging logs
-        print(f"No signal for {symbol}.")
+            elif sell_signal:
+                msg = (
+                    f"📉 **STRONG SELL: {symbol}**\n"
+                    f"Price: {close:.2f}\n"
+                    f"Vol: {int(vol)} (Avg: {int(curr['avg_vol'])})\n"
+                    f"Breakdown: < {curr['pivot_low']:.2f}\n"
+                    f"Trend: Below EMA200 & VWAP"
+                )
+                print(f"🔔 SELL SIGNAL: {symbol}")
+                send_telegram_message(msg)
+            
+            # Rate limit protection (prevents TV ban)
+            time.sleep(0.3)
 
-def main():
-    print("🚀 Starting EGX Algorithmic Signal Engine...")
-    for symbol in SYMBOLS:
-        process_symbol(symbol)
-    print("✅ Analysis Complete.")
+        except Exception as e:
+            # print(f"❌ Error on {symbol}: {e}")
+            continue
 
 if __name__ == "__main__":
-    main()
+    analyze_market()
