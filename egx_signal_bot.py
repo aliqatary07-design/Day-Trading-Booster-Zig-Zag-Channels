@@ -39,7 +39,6 @@ def get_egx_symbols_from_screener():
     """
     print("🌍 Scanning TradingView Egypt Screener for all active stocks...")
     
-    # FIXED: Changed 'true' to 'True' for Python boolean
     payload = {
         "filter": [
             {"left": "type", "operation": "equal", "right": "stock"},
@@ -82,9 +81,9 @@ def analyze_market():
     # 1. Get Dynamic Symbol List
     symbols = get_egx_symbols_from_screener()
     
-    # 2. Initialize Datafeed
+    # 2. Initialize Datafeed (FIXED: No arguments needed for guest mode)
     print("🚀 Connecting to TradingView Datafeed...")
-    tv = TvDatafeed(auto_login=False) 
+    tv = TvDatafeed() 
     
     for symbol in symbols:
         try:
